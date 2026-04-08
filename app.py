@@ -170,38 +170,47 @@ def load_store_performance(location_id, week_start):
     valid_prev = [s for s in prev_sales if s is not None]
     avg_prev = sum(valid_prev) / len(valid_prev) if valid_prev else None
 
-    # SoS (last 4 weeks)
-    sos_data = []
-    for i in range(1, 5):
-        sw = (ws_date - timedelta(weeks=i)).strftime("%Y-%m-%d")
-        sr = sb.table("store_sos").select("sos_seconds, sos_rank, total_stores").eq(
-            "location_id", location_id).eq("week_start", sw).execute()
-        if sr.data:
-            sos_data.append(sr.data[0])
+    # SoS (last 4 weeks) — uses store_sos_weekly with total_time as "MM:SS"
+    avg_sos = last_sos_rank = last_sos_total = None
+    try:
+        sos_rows = sb.table("store_sos_weekly").select(
+            "week_start, good_shift_rank, total_stores, total_time"
+        ).eq("location_id", location_id).gte(
+            "week_start", str(ws_date - timedelta(weeks=4))
+        ).lt("week_start", str(ws_date)).order("week_start", desc=True).execute().data or []
 
-    avg_sos = None
-    if sos_data:
-        vals = [s["sos_seconds"] for s in sos_data if s.get("sos_seconds")]
-        avg_sos = sum(vals) / len(vals) if vals else None
-    last_sos_rank = sos_data[0].get("sos_rank") if sos_data else None
-    last_sos_total = sos_data[0].get("total_stores") if sos_data else None
+        if sos_rows:
+            last_sos_rank  = sos_rows[0].get("good_shift_rank")
+            last_sos_total = sos_rows[0].get("total_stores")
+            secs = []
+            for r in sos_rows:
+                tt = str(r.get("total_time") or "")
+                if ":" in tt:
+                    try:
+                        m, s = tt.split(":")
+                        secs.append(int(m) * 60 + int(s))
+                    except (ValueError, IndexError):
+                        pass
+            avg_sos = sum(secs) / len(secs) if secs else None
+    except Exception:
+        pass
 
-    # VOTG (last 4 weeks)
-    votg_data = []
-    for i in range(1, 5):
-        vw = (ws_date - timedelta(weeks=i)).strftime("%Y-%m-%d")
-        vr = sb.table("store_votg").select(
-            "total_negative_reviews, votg_rank, total_stores"
-        ).eq("location_id", location_id).eq("week_start", vw).execute()
-        if vr.data:
-            votg_data.append(vr.data[0])
+    # VOTG (last 4 weeks) — uses store_votg_weekly
+    avg_neg = last_votg_rank = last_votg_total = None
+    try:
+        votg_rows = sb.table("store_votg_weekly").select(
+            "week_start, total_negative_reviews, votg_rank, total_stores"
+        ).eq("location_id", location_id).gte(
+            "week_start", str(ws_date - timedelta(weeks=4))
+        ).lt("week_start", str(ws_date)).order("week_start", desc=True).execute().data or []
 
-    avg_neg = None
-    if votg_data:
-        vals = [v["total_negative_reviews"] for v in votg_data if v.get("total_negative_reviews")]
-        avg_neg = sum(vals) / len(vals) if vals else None
-    last_votg_rank = votg_data[0].get("votg_rank") if votg_data else None
-    last_votg_total = votg_data[0].get("total_stores") if votg_data else None
+        if votg_rows:
+            last_votg_rank  = votg_rows[0].get("votg_rank")
+            last_votg_total = votg_rows[0].get("total_stores")
+            negs = [float(r.get("total_negative_reviews") or 0) for r in votg_rows]
+            avg_neg = sum(negs) / len(negs) if negs else None
+    except Exception:
+        pass
 
     return {
         "py_sales": py_sales,
