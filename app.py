@@ -638,7 +638,7 @@ if selected_band in band_goals:
 # ---------------------------------------------------------------------------
 st.markdown("")
 
-if st.button("Submit Revenue Band", type="primary", use_container_width=True):
+if not st.session_state.get("submitted") and st.button("Submit Revenue Band", type="primary", use_container_width=True):
     try:
         # Update the submission record
         sb.table("rev_band_submissions").update({
@@ -718,6 +718,7 @@ if st.button("Submit Revenue Band", type="primary", use_container_width=True):
         except Exception:
             pass  # Don't block submission if DM email fails
 
+        st.session_state["submitted"] = True
         st.markdown("""
         <div class="success-box">
             <h3>✅ Submitted Successfully!</h3>
@@ -727,6 +728,7 @@ if st.button("Submit Revenue Band", type="primary", use_container_width=True):
         """, unsafe_allow_html=True)
 
         st.balloons()
+        st.stop()
 
     except Exception as e:
         st.error(f"Something went wrong. Please try again or contact your manager. Error: {str(e)}")
