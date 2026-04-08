@@ -7,7 +7,7 @@ Dual-purpose app:
 """
 
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
 # ---------------------------------------------------------------------------
@@ -457,7 +457,7 @@ if role == "dm":
                 if st.button(f"✅ Approve", key=f"approve_{sid}", use_container_width=True):
                     sb.table("rev_band_submissions").update({
                         "status": "pending_admin",
-                        "dm_approved_at": datetime.utcnow().isoformat(),
+                        "dm_approved_at": datetime.now(timezone.utc).isoformat(),
                         "dm_approved_by": dm_name,
                     }).eq("id", sub["id"]).execute()
                     st.success(f"Approved {s['store_name']}")
@@ -485,7 +485,7 @@ if role == "dm":
                     sb.table("rev_band_submissions").update({
                         "status":           "pending_admin",
                         "dm_override_band": dm_override,
-                        "rejected_at":      datetime.utcnow().isoformat(),
+                        "rejected_at":      datetime.now(timezone.utc).isoformat(),
                         "rejected_by":      dm_name,
                         "rejection_reason": reason,
                     }).eq("id", sub["id"]).execute()
@@ -549,7 +549,6 @@ if role == "dm":
 
                     st.session_state[f"rejecting_{sid}"] = False
                     st.warning(f"Override saved for {s['store_name']} — band set to {dm_override}")
-                    st.rerun()
                     st.rerun()
 
             st.divider()
@@ -710,7 +709,7 @@ if not st.session_state.get("submitted") and st.button("Submit Revenue Band", ty
         # Update the submission record
         sb.table("rev_band_submissions").update({
             "selected_band": selected_band,
-            "submitted_at": datetime.utcnow().isoformat(),
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
             "status": "pending_dm",
         }).eq("token", token).execute()
 
