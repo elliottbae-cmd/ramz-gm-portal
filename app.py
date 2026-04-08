@@ -149,21 +149,23 @@ def fmt_minutes(seconds):
 
 def load_store_performance(location_id, week_start):
     """Load sales, SoS, VOTG data for a store relative to a week."""
-    ws_date = datetime.strptime(week_start, "%Y-%m-%d")
+    from datetime import date as date_type
+    ws_date = datetime.strptime(week_start, "%Y-%m-%d").date()
 
-    # Prior year sales
-    py_ws = (ws_date - timedelta(weeks=52)).strftime("%Y-%m-%d")
-    py_resp = sb.table("store_sales").select("net_sales").eq(
-        "location_id", location_id).eq("week_start", py_ws).execute()
-    py_sales = py_resp.data[0]["net_sales"] if py_resp.data else None
+    def get_week_sales(week_thu):
+        """Sum all sale_date rows in a Thu–Wed window (handles daily or weekly storage)."""
+        week_end = week_thu + timedelta(days=7)
+        resp = sb.table("store_sales").select("sale_date,net_sales").eq(
+            "location_id", location_id
+        ).gte("sale_date", str(week_thu)).lt("sale_date", str(week_end)).execute()
+        total = sum(float(r.get("net_sales") or 0) for r in (resp.data or []))
+        return total if total > 0 else None
 
-    # Last 2 weeks sales
-    prev_sales = []
-    for i in range(1, 3):
-        pw = (ws_date - timedelta(weeks=i)).strftime("%Y-%m-%d")
-        pw_resp = sb.table("store_sales").select("net_sales").eq(
-            "location_id", location_id).eq("week_start", pw).execute()
-        prev_sales.append(pw_resp.data[0]["net_sales"] if pw_resp.data else None)
+    # Prior year: same Thu–Wed week 52 weeks ago
+    py_sales = get_week_sales(ws_date - timedelta(weeks=52))
+
+    # Last 2 completed weeks
+    prev_sales = [get_week_sales(ws_date - timedelta(weeks=i)) for i in range(1, 3)]
 
     valid_prev = [s for s in prev_sales if s is not None]
     avg_prev = sum(valid_prev) / len(valid_prev) if valid_prev else None
