@@ -467,22 +467,89 @@ if role == "dm":
                 if st.button(f"❌ Reject", key=f"reject_{sid}", use_container_width=True):
                     st.session_state[f"rejecting_{sid}"] = True
 
-            # Rejection reason input
+            # Rejection / DM override form
             if st.session_state.get(f"rejecting_{sid}", False):
                 reason = st.text_input(
                     f"Rejection reason for {s['store_name']}",
                     key=f"reason_{sid}",
                     placeholder="Enter reason for rejection..."
                 )
-                if st.button(f"Confirm Rejection", key=f"confirm_reject_{sid}"):
+                dm_override = st.selectbox(
+                    "Select Revenue Band to Use Instead",
+                    options=list(band_goals.keys()),
+                    index=list(band_goals.keys()).index(current_band) if current_band in band_goals else 0,
+                    key=f"override_{sid}",
+                    help="This band will be used for the week. The GM will be notified."
+                )
+                if st.button(f"Confirm Override", key=f"confirm_reject_{sid}"):
                     sb.table("rev_band_submissions").update({
-                        "status": "rejected",
-                        "rejected_at": datetime.utcnow().isoformat(),
-                        "rejected_by": dm_name,
+                        "status":           "pending_admin",
+                        "dm_override_band": dm_override,
+                        "rejected_at":      datetime.utcnow().isoformat(),
+                        "rejected_by":      dm_name,
                         "rejection_reason": reason,
                     }).eq("id", sub["id"]).execute()
+
+                    # Notify GM of DM override
+                    try:
+                        gm_resp = sb.table("gm_contacts").select("email, gm_name").eq(
+                            "location_id", sid).execute()
+                        if gm_resp.data and gm_resp.data[0].get("email"):
+                            gm_email = gm_resp.data[0]["email"]
+                            gm_name_notify = gm_resp.data[0].get("gm_name", "Team")
+                            api_key   = st.secrets.get("sendgrid", {}).get("api_key", "")
+                            from_email = st.secrets.get("sendgrid", {}).get("from_email", "")
+                            override_goal = band_goals.get(dm_override, 0)
+                            if api_key and from_email:
+                                from sendgrid import SendGridAPIClient
+                                from sendgrid.helpers.mail import Mail
+                                html = f"""
+                                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;
+                                            border:1px solid #E0D5C9;border-radius:8px;overflow:hidden;">
+                                    <div style="background:#2B3A4E;padding:20px;text-align:center;">
+                                        <h2 style="color:#C49A5C;margin:0;">Revenue Band Update</h2>
+                                    </div>
+                                    <div style="padding:24px;">
+                                        <p>Hi {gm_name_notify},</p>
+                                        <p>Your District Manager has reviewed your revenue band submission
+                                        for <strong>{s['store_name']}</strong> — Week of <strong>{week_start}</strong>
+                                        and has selected a different band.</p>
+                                        <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+                                            <tr style="background:#F5F0EB;">
+                                                <td style="padding:10px;font-weight:600;">Revenue Band</td>
+                                                <td style="padding:10px;font-size:18px;font-weight:bold;">{dm_override}</td>
+                                            </tr>
+                                            <tr>
+                                                <td style="padding:10px;font-weight:600;">Hourly Goal</td>
+                                                <td style="padding:10px;font-size:18px;font-weight:bold;">{override_goal:.0f} hours</td>
+                                            </tr>
+                                            <tr style="background:#F5F0EB;">
+                                                <td style="padding:10px;font-weight:600;">Reason</td>
+                                                <td style="padding:10px;">{reason or "No reason provided"}</td>
+                                            </tr>
+                                        </table>
+                                        <p style="color:#666;font-size:13px;">
+                                            If you have questions, please contact your District Manager.
+                                        </p>
+                                    </div>
+                                    <div style="padding:12px 24px;background:#F5F0EB;text-align:center;">
+                                        <p style="color:#888;font-size:12px;">Ram-Z Restaurant Group</p>
+                                    </div>
+                                </div>
+                                """
+                                sg = SendGridAPIClient(api_key)
+                                sg.send(Mail(
+                                    from_email=from_email,
+                                    to_emails=gm_email,
+                                    subject=f"Revenue Band Update: {s['store_name']} — Week of {week_start}",
+                                    html_content=html,
+                                ))
+                    except Exception:
+                        pass  # Don't block override if GM email fails
+
                     st.session_state[f"rejecting_{sid}"] = False
-                    st.warning(f"Rejected {s['store_name']}")
+                    st.warning(f"Override saved for {s['store_name']} — band set to {dm_override}")
+                    st.rerun()
                     st.rerun()
 
             st.divider()
