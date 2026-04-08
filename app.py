@@ -152,6 +152,13 @@ def load_store_performance(location_id, week_start):
     from datetime import date as date_type
     ws_date = datetime.strptime(week_start, "%Y-%m-%d").date()
 
+    # Anchor to last COMPLETED Thu-Wed week (not the upcoming target week)
+    today = date_type.today()
+    days_since_thu = (today.weekday() - 3) % 7
+    current_week_start = today - timedelta(days=days_since_thu)
+    last_complete_week = current_week_start - timedelta(weeks=1)
+    two_weeks_ago     = current_week_start - timedelta(weeks=2)
+
     def get_week_sales(week_thu):
         """Sum all sale_date rows in a Thu–Wed window (handles daily or weekly storage)."""
         week_end = week_thu + timedelta(days=7)
@@ -161,11 +168,11 @@ def load_store_performance(location_id, week_start):
         total = sum(float(r.get("net_sales") or 0) for r in (resp.data or []))
         return total if total > 0 else None
 
-    # Prior year: same Thu–Wed week 52 weeks ago
-    py_sales = get_week_sales(ws_date - timedelta(weeks=52))
+    # Prior year: same Thu–Wed week 52 weeks ago (relative to last complete week)
+    py_sales = get_week_sales(last_complete_week - timedelta(weeks=52))
 
     # Last 2 completed weeks
-    prev_sales = [get_week_sales(ws_date - timedelta(weeks=i)) for i in range(1, 3)]
+    prev_sales = [get_week_sales(last_complete_week), get_week_sales(two_weeks_ago)]
 
     valid_prev = [s for s in prev_sales if s is not None]
     avg_prev = sum(valid_prev) / len(valid_prev) if valid_prev else None
@@ -176,8 +183,8 @@ def load_store_performance(location_id, week_start):
         sos_rows = sb.table("store_sos_weekly").select(
             "week_start, good_shift_rank, total_stores, total_time"
         ).eq("location_id", location_id).gte(
-            "week_start", str(ws_date - timedelta(weeks=4))
-        ).lt("week_start", str(ws_date)).order("week_start", desc=True).execute().data or []
+            "week_start", str(current_week_start - timedelta(weeks=4))
+        ).lt("week_start", str(current_week_start)).order("week_start", desc=True).execute().data or []
 
         if sos_rows:
             last_sos_rank  = sos_rows[0].get("good_shift_rank")
@@ -201,8 +208,8 @@ def load_store_performance(location_id, week_start):
         votg_rows = sb.table("store_votg_weekly").select(
             "week_start, total_negative_reviews, votg_rank, total_stores"
         ).eq("location_id", location_id).gte(
-            "week_start", str(ws_date - timedelta(weeks=4))
-        ).lt("week_start", str(ws_date)).order("week_start", desc=True).execute().data or []
+            "week_start", str(current_week_start - timedelta(weeks=4))
+        ).lt("week_start", str(current_week_start)).order("week_start", desc=True).execute().data or []
 
         if votg_rows:
             last_votg_rank  = votg_rows[0].get("votg_rank")
