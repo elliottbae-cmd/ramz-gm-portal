@@ -159,8 +159,18 @@ def load_store_performance(location_id, week_start):
     last_complete_week = current_week_start - timedelta(weeks=1)
     two_weeks_ago     = current_week_start - timedelta(weeks=2)
 
-    def get_week_sales(week_thu):
-        """Sum all sale_date rows in a Thu–Wed window (handles daily or weekly storage)."""
+    def get_week_sales_actuals(week_thu):
+        """Pull weekly net sales from weekly_actuals (full week total from AVS upload)."""
+        resp = sb.table("weekly_actuals").select("net_sales").eq(
+            "location_id", location_id
+        ).eq("week_start", str(week_thu)).execute()
+        if resp.data and resp.data[0].get("net_sales"):
+            total = float(resp.data[0]["net_sales"])
+            return total if total > 0 else None
+        return None
+
+    def get_week_sales_daily(week_thu):
+        """Fallback: sum store_sales daily rows (used for prior year which isn't in weekly_actuals yet)."""
         week_end = week_thu + timedelta(days=7)
         resp = sb.table("store_sales").select("sale_date,net_sales").eq(
             "location_id", location_id
@@ -168,11 +178,11 @@ def load_store_performance(location_id, week_start):
         total = sum(float(r.get("net_sales") or 0) for r in (resp.data or []))
         return total if total > 0 else None
 
-    # Prior year: same Thu–Wed week 52 weeks ago (relative to last complete week)
-    py_sales = get_week_sales(last_complete_week - timedelta(weeks=52))
+    # Prior year: use daily store_sales (weekly_actuals doesn't go back a year yet)
+    py_sales = get_week_sales_daily(last_complete_week - timedelta(weeks=52))
 
-    # Last 2 completed weeks
-    prev_sales = [get_week_sales(last_complete_week), get_week_sales(two_weeks_ago)]
+    # Last 2 completed weeks: use weekly_actuals for accurate full-week totals
+    prev_sales = [get_week_sales_actuals(last_complete_week), get_week_sales_actuals(two_weeks_ago)]
 
     valid_prev = [s for s in prev_sales if s is not None]
     avg_prev = sum(valid_prev) / len(valid_prev) if valid_prev else None
