@@ -30,6 +30,11 @@ def get_supabase():
 
 sb = get_supabase()
 
+# Load band goals once — used by both GM and DM views
+_bands_resp = sb.table("band_goals").select("revenue_band, hourly_goal").order("hourly_goal").execute()
+band_goals  = {b["revenue_band"]: b["hourly_goal"] for b in _bands_resp.data} if _bands_resp.data else {}
+band_options = list(band_goals.keys())
+
 # ---------------------------------------------------------------------------
 # Ram-Z branding CSS
 # ---------------------------------------------------------------------------
@@ -209,8 +214,8 @@ def load_store_performance(location_id, week_start):
                     except (ValueError, IndexError):
                         pass
             avg_sos = sum(secs) / len(secs) if secs else None
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] SoS load failed for {location_id}: {e}")
 
     # VOTG (last 4 weeks) — uses store_votg_weekly
     avg_neg = last_votg_rank = last_votg_total = None
@@ -226,8 +231,8 @@ def load_store_performance(location_id, week_start):
             last_votg_total = votg_rows[0].get("total_stores")
             negs = [float(r.get("total_negative_reviews") or 0) for r in votg_rows]
             avg_neg = sum(negs) / len(negs) if negs else None
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] VOTG load failed for {location_id}: {e}")
 
     return {
         "py_sales": py_sales,
@@ -241,6 +246,111 @@ def load_store_performance(location_id, week_start):
         "last_votg_rank": last_votg_rank,
         "last_votg_total": last_votg_total,
     }
+
+
+def load_performance_batch(store_ids, week_start_str):
+    """
+    Batch-load performance data for multiple stores in 4 queries instead of 5×N.
+    Returns {location_id: perf_dict} with the same keys as load_store_performance().
+    """
+    from datetime import date as date_type
+    if not store_ids:
+        return {}
+
+    today = date_type.today()
+    days_since_thu     = (today.weekday() - 3) % 7
+    current_week_start = today - timedelta(days=days_since_thu)
+    last_complete_week = current_week_start - timedelta(weeks=1)
+    two_weeks_ago      = current_week_start - timedelta(weeks=2)
+    py_week            = last_complete_week  - timedelta(weeks=52)
+    py_week_end        = py_week + timedelta(days=7)
+
+    # 1. weekly_actuals — last 2 complete weeks for all stores
+    wa_resp = sb.table("weekly_actuals").select("location_id,week_start,net_sales").in_(
+        "location_id", store_ids
+    ).gte("week_start", str(two_weeks_ago)).lt("week_start", str(current_week_start)).execute()
+    wa_by_store = {}
+    for r in (wa_resp.data or []):
+        lid = r["location_id"]
+        ws  = date.fromisoformat(str(r["week_start"])[:10])
+        wa_by_store.setdefault(lid, {})[ws] = float(r.get("net_sales") or 0)
+
+    # 2. store_sales — prior-year week (daily rows, batch for all stores)
+    py_resp = sb.table("store_sales").select("location_id,net_sales").in_(
+        "location_id", store_ids
+    ).gte("sale_date", str(py_week)).lt("sale_date", str(py_week_end)).execute()
+    py_by_store = {}
+    for r in (py_resp.data or []):
+        lid = r["location_id"]
+        py_by_store[lid] = py_by_store.get(lid, 0) + float(r.get("net_sales") or 0)
+
+    # 3. store_sos_weekly — last 4 weeks for all stores
+    sos_resp = sb.table("store_sos_weekly").select(
+        "location_id,week_start,good_shift_rank,total_stores,total_time"
+    ).in_("location_id", store_ids).gte(
+        "week_start", str(current_week_start - timedelta(weeks=4))
+    ).lt("week_start", str(current_week_start)).order("week_start", desc=True).execute()
+    sos_by_store = {}
+    for r in (sos_resp.data or []):
+        sos_by_store.setdefault(r["location_id"], []).append(r)
+
+    # 4. store_votg_weekly — last 4 weeks for all stores
+    votg_resp = sb.table("store_votg_weekly").select(
+        "location_id,week_start,total_negative_reviews,votg_rank,total_stores"
+    ).in_("location_id", store_ids).gte(
+        "week_start", str(current_week_start - timedelta(weeks=4))
+    ).lt("week_start", str(current_week_start)).order("week_start", desc=True).execute()
+    votg_by_store = {}
+    for r in (votg_resp.data or []):
+        votg_by_store.setdefault(r["location_id"], []).append(r)
+
+    # Assemble per-store perf dicts matching load_store_performance() output
+    result = {}
+    for lid in store_ids:
+        wa      = wa_by_store.get(lid, {})
+        lw_val  = wa.get(last_complete_week)
+        tw_val  = wa.get(two_weeks_ago)
+        valid   = [s for s in [lw_val, tw_val] if s and s > 0]
+        avg_prev = sum(valid) / len(valid) if valid else None
+        py_total = py_by_store.get(lid, 0)
+
+        avg_sos = last_sos_rank = last_sos_total = None
+        sos_rows = sos_by_store.get(lid, [])
+        if sos_rows:
+            last_sos_rank  = sos_rows[0].get("good_shift_rank")
+            last_sos_total = sos_rows[0].get("total_stores")
+            secs = []
+            for r in sos_rows:
+                tt = str(r.get("total_time") or "")
+                if ":" in tt:
+                    try:
+                        m, s = tt.split(":")
+                        secs.append(int(m) * 60 + int(s))
+                    except (ValueError, IndexError):
+                        pass
+            avg_sos = sum(secs) / len(secs) if secs else None
+
+        avg_neg = last_votg_rank = last_votg_total = None
+        votg_rows = votg_by_store.get(lid, [])
+        if votg_rows:
+            last_votg_rank  = votg_rows[0].get("votg_rank")
+            last_votg_total = votg_rows[0].get("total_stores")
+            negs = [float(r.get("total_negative_reviews") or 0) for r in votg_rows]
+            avg_neg = sum(negs) / len(negs) if negs else None
+
+        result[lid] = {
+            "py_sales":      py_total if py_total > 0 else None,
+            "prev_week_1":   lw_val,
+            "prev_week_2":   tw_val,
+            "avg_prev_2":    avg_prev,
+            "avg_sos":       avg_sos,
+            "last_sos_rank": last_sos_rank,
+            "last_sos_total":last_sos_total,
+            "avg_neg_reviews": avg_neg,
+            "last_votg_rank":  last_votg_rank,
+            "last_votg_total": last_votg_total,
+        }
+    return result
 
 
 def display_performance_cards(perf):
@@ -282,6 +392,77 @@ def display_performance_cards(perf):
         else:
             st.metric("VOTG Rank (Last Week)", "N/A")
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_sentiment_section(sentiment_data, store_name=None, header=True):
+    """
+    Render the cached "What Customers Are Saying" sentiment summary.
+
+    sentiment_data is a dict (from rev_band_submissions.sentiment_summary_data),
+    or None if not generated for this submission.
+
+    Format:
+      - 1 paragraph summary (Claude-generated)
+      - Top 5 hours where negative reviews clustered
+      - Footer: review count + when generated
+    """
+    if not sentiment_data or not isinstance(sentiment_data, dict):
+        st.info("💬 Sentiment summary will be available after Friday's email run.")
+        return
+
+    summary = (sentiment_data.get("summary") or "").strip()
+    hours   = sentiment_data.get("negative_hours") or []
+    rev_ct  = sentiment_data.get("review_count") or 0
+    neg_ct  = sentiment_data.get("negative_count") or 0
+
+    if header:
+        st.markdown("### 💬 What Customers Are Saying — Past 2 Weeks")
+
+    if summary:
+        st.markdown(
+            f"<p style='color:#333;font-size:15px;line-height:1.6;"
+            f"background:#F5F0EB;padding:14px 18px;border-radius:6px;'>{summary}</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("Not enough recent guest feedback to summarize.")
+
+    # Negative hour distribution
+    if hours:
+        st.markdown("**When complaints are coming in (top hours):**")
+        rows = ""
+        for hour, count in hours:
+            label = f"{count} negative review" + ("s" if count != 1 else "")
+            rows += (
+                f"<li style='padding:4px 0;color:#444;font-size:14px;'>"
+                f"<strong>{hour}</strong> &mdash; {label}</li>"
+            )
+        st.markdown(f"<ul>{rows}</ul>", unsafe_allow_html=True)
+    elif summary:
+        st.success("No negative reviews in this period — keep it up! 🎉")
+
+    # Footer
+    if rev_ct:
+        st.caption(
+            f"Based on {rev_ct} review{'s' if rev_ct != 1 else ''}"
+            f" ({neg_ct} negative) over the past 2 weeks."
+        )
+
+
+def _portal_email_wrap(title: str, body_html: str) -> str:
+    """Wrap body content in the Ram-Z branded portal email shell."""
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;
+                border:1px solid #E0D5C9;border-radius:8px;overflow:hidden;">
+        <div style="background:#2B3A4E;padding:20px;text-align:center;">
+            <h2 style="color:#C49A5C;margin:0;">{title}</h2>
+        </div>
+        <div style="padding:24px;">{body_html}</div>
+        <div style="padding:12px 24px;background:#F5F0EB;text-align:center;">
+            <p style="color:#888;font-size:12px;">Ram-Z Restaurant Group</p>
+        </div>
+    </div>
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +519,6 @@ if role == "dm":
         "week_start", week_start).execute()
     all_subs = {s["location_id"]: s for s in all_subs_resp.data
                 if s["location_id"] in dm_store_ids}
-
-    # Load band goals
-    bands_resp = sb.table("band_goals").select("revenue_band, hourly_goal").order("hourly_goal").execute()
-    band_goals = {b["revenue_band"]: b["hourly_goal"] for b in bands_resp.data} if bands_resp.data else {}
 
     # ---------------------------------------------------------------------------
     # DM Header
@@ -426,6 +603,9 @@ if role == "dm":
     review_ids = [sid for sid in dm_store_ids
                   if sid in all_subs and all_subs[sid]["status"] == "pending_dm"]
 
+    # Pre-batch load perf data (4 queries regardless of store count)
+    _review_perf = load_performance_batch(review_ids, week_start) if review_ids else {}
+
     if review_ids:
         st.markdown("### 📋 Ready for Your Approval")
         for sid in sorted(review_ids, key=lambda x: store_names.get(x, "")):
@@ -456,9 +636,17 @@ if role == "dm":
                 else:
                     st.success("No change")
 
-            # Expandable performance data
-            with st.expander(f"View {s['store_name']} Performance Data"):
-                perf = load_store_performance(sid, week_start)
+            # Expandable sentiment summary (cached on submission row)
+            with st.expander(f"💬 What Customers Are Saying at {s['store_name']}"):
+                render_sentiment_section(
+                    sub.get("sentiment_summary_data"),
+                    store_name=s['store_name'],
+                    header=False,
+                )
+
+            # Expandable performance data (uses pre-batched data)
+            with st.expander(f"📊 View {s['store_name']} Performance Data"):
+                perf = _review_perf.get(sid) or load_store_performance(sid, week_start)
                 display_performance_cards(perf)
 
             # Approve / Reject buttons
@@ -513,13 +701,7 @@ if role == "dm":
                             if api_key and from_email:
                                 from sendgrid import SendGridAPIClient
                                 from sendgrid.helpers.mail import Mail
-                                html = f"""
-                                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;
-                                            border:1px solid #E0D5C9;border-radius:8px;overflow:hidden;">
-                                    <div style="background:#2B3A4E;padding:20px;text-align:center;">
-                                        <h2 style="color:#C49A5C;margin:0;">Revenue Band Update</h2>
-                                    </div>
-                                    <div style="padding:24px;">
+                                html = _portal_email_wrap("Revenue Band Update", f"""
                                         <p>Hi {gm_name_notify},</p>
                                         <p>Your District Manager has reviewed your revenue band submission
                                         for <strong>{s['store_name']}</strong> — Week of <strong>{week_start}</strong>
@@ -541,12 +723,7 @@ if role == "dm":
                                         <p style="color:#666;font-size:13px;">
                                             If you have questions, please contact your District Manager.
                                         </p>
-                                    </div>
-                                    <div style="padding:12px 24px;background:#F5F0EB;text-align:center;">
-                                        <p style="color:#888;font-size:12px;">Ram-Z Restaurant Group</p>
-                                    </div>
-                                </div>
-                                """
+                                """)
                                 sg = SendGridAPIClient(api_key)
                                 sg.send(Mail(
                                     from_email=from_email,
@@ -554,8 +731,8 @@ if role == "dm":
                                     subject=f"Revenue Band Update: {s['store_name']} — Week of {week_start}",
                                     html_content=html,
                                 ))
-                    except Exception:
-                        pass  # Don't block override if GM email fails
+                    except Exception as e:
+                        print(f"[WARN] GM notification email failed for {s.get('store_name','?')}: {e}")
 
                     st.session_state[f"rejecting_{sid}"] = False
                     st.warning(f"Override saved for {s['store_name']} — band set to {dm_override}")
@@ -655,8 +832,8 @@ if token_expires:
             </div>
             """, unsafe_allow_html=True)
             st.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] Token deadline check failed for token={token}: {e}")
 
 # Load store info
 store_resp = sb.table("reference_data").select("*").eq("location_id", location_id).execute()
@@ -678,6 +855,11 @@ st.markdown(f"""
 
 st.divider()
 
+# What Customers Are Saying (sentiment hook — read from cached column)
+render_sentiment_section(submission.get("sentiment_summary_data"))
+
+st.divider()
+
 # Load and display performance data
 perf = load_store_performance(location_id, week_start)
 display_performance_cards(perf)
@@ -686,10 +868,6 @@ display_performance_cards(perf)
 # Revenue Band Selection
 # ---------------------------------------------------------------------------
 st.divider()
-
-bands_resp = sb.table("band_goals").select("revenue_band, hourly_goal").order("hourly_goal").execute()
-band_options = [b["revenue_band"] for b in bands_resp.data] if bands_resp.data else []
-band_goals = {b["revenue_band"]: b["hourly_goal"] for b in bands_resp.data} if bands_resp.data else {}
 
 current_band = store.get("revenue_band", "")
 
@@ -738,13 +916,7 @@ if not st.session_state.get("submitted") and st.button("Submit Revenue Band", ty
                     # DM gets a link to the same app with role=dm
                     dm_url = f"https://ramz-gm-select.streamlit.app/?token={token}&role=dm"
 
-                    html = f"""
-                    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;
-                                border:1px solid #E0D5C9;border-radius:8px;overflow:hidden;">
-                        <div style="background:#2B3A4E;padding:20px;text-align:center;">
-                            <h2 style="color:#C49A5C;margin:0;">Revenue Band Approval</h2>
-                        </div>
-                        <div style="padding:24px;">
+                    html = _portal_email_wrap("Revenue Band Approval", f"""
                             <p>The GM at <strong>{store_name}</strong> has submitted their
                             revenue band selection for the week of <strong>{week_start}</strong>.</p>
                             <table style="width:100%;border-collapse:collapse;margin:16px 0;">
@@ -766,12 +938,7 @@ if not st.session_state.get("submitted") and st.button("Submit Revenue Band", ty
                                    padding:12px 32px;border-radius:6px;text-decoration:none;
                                    font-weight:600;">Review All Stores</a>
                             </div>
-                        </div>
-                        <div style="padding:12px 24px;background:#F5F0EB;text-align:center;">
-                            <p style="color:#888;font-size:12px;">Ram-Z Restaurant Group</p>
-                        </div>
-                    </div>
-                    """
+                    """)
 
                     message = Mail(
                         from_email=from_email,
@@ -791,8 +958,8 @@ if not st.session_state.get("submitted") and st.button("Submit Revenue Band", ty
                         "email_type": "dm_approval_request",
                         "reminder_number": 0,
                     }).execute()
-        except Exception:
-            pass  # Don't block submission if DM email fails
+        except Exception as e:
+            print(f"[WARN] DM approval email failed for {location_id}: {e}")
 
         st.session_state["submitted"] = True
         st.markdown("""
